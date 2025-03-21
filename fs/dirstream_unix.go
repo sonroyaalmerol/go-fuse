@@ -27,9 +27,14 @@ type loopbackDirStream struct {
 	fd        int
 }
 
-// NewLoopbackDirStreamFd reads the directory opened at file descriptor fd as
-// a DirStream
-func NewLoopbackDirStreamFd(fd int) (DirStream, syscall.Errno) {
+// NewLoopbackDirStream open a directory for reading as a DirStream
+func NewLoopbackDirStream(name string) (DirStream, syscall.Errno) {
+	// TODO: should return concrete type.
+	fd, err := syscall.Open(name, syscall.O_DIRECTORY, 0755)
+	if err != nil {
+		return nil, ToErrno(err)
+	}
+
 	ds := &loopbackDirStream{
 		buf: make([]byte, 4096),
 		fd:  fd,

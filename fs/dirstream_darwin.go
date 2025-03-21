@@ -12,8 +12,11 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-func NewLoopbackDirStreamFd(fd int) (DirStream, syscall.Errno) {
-	f := os.NewFile(uintptr(fd), "")
+func NewLoopbackDirStream(nm string) (DirStream, syscall.Errno) {
+	f, err := os.Open(nm)
+	if err != nil {
+		return nil, ToErrno(err)
+	}
 	defer f.Close()
 
 	var entries []fuse.DirEntry

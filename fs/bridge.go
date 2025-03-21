@@ -20,6 +20,12 @@ func errnoToStatus(errno syscall.Errno) fuse.Status {
 	return fuse.Status(errno)
 }
 
+var fileEntryPool = &sync.Pool{
+	New: func() any {
+		return &fileEntry{}
+	},
+}
+
 type fileEntry struct {
 	file FileHandle
 
@@ -806,7 +812,7 @@ func (b *rawBridge) releaseBackingIDRef(n *Inode) {
 // registerFile hands out a file handle. Must have bridge.mu. Flags are the open flags
 // (eg. syscall.O_EXCL).
 func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntry {
-	fe := &fileEntry{}
+	fe := fileEntryPool.Get().(*fileEntry)
 	if len(b.freeFiles) > 0 {
 		last := len(b.freeFiles) - 1
 		fe.fh = b.freeFiles[last]
@@ -903,6 +909,8 @@ func (b *rawBridge) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 
 	b.releaseBackingIDRef(n)
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
+
+	fileEntryPool.Put(f)
 }
 
 func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
@@ -917,6 +925,8 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	defer b.mu.Unlock()
 	b.releaseBackingIDRef(n)
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
+
+	fileEntryPool.Put(f)
 }
 
 func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*Inode, *fileEntry) {

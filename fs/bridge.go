@@ -29,9 +29,6 @@ var fileEntryPool = &sync.Pool{
 type fileEntry struct {
 	file FileHandle
 
-	// index into Inode.openFiles
-	nodeIndex int
-
 	// Handle number which we communicate to the kernel.
 	fh uint32
 
@@ -106,10 +103,7 @@ type rawBridge struct {
 	// nextNodeID is the next free NodeID. Increment after copying the value.
 	nextNodeId uint64
 
-	files []*fileEntry
-
-	// indices of files that are not allocated.
-	freeFiles []uint32
+	files *xsync.MapOf[uint64, *fileEntry]
 
 	// If set, don't try to register backing file for Create/Open calls.
 	disableBackingFiles bool
@@ -323,7 +317,7 @@ func NewNodeFS(root InodeEmbedder, opts *Options) fuse.RawFileSystem {
 	bridge._setNode(1, bridge.root)
 
 	// Fh 0 means no file handle.
-	bridge.files = []*fileEntry{{}}
+	bridge.files = xsync.NewMapOf[uint64, *fileEntry]()
 
 	if opts.OnAdd != nil {
 		opts.OnAdd(context.Background())
@@ -373,9 +367,10 @@ func (b *rawBridge) _removeNode(id uint64) {
 }
 
 func (b *rawBridge) getFile(fh uint64) *fileEntry {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.files[fh]
+	if curr, ok := b.files.Load(fh); ok {
+		return curr
+	}
+	return nil
 }
 
 func (b *rawBridge) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -536,11 +531,16 @@ func (b *rawBridge) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		// descriptor, so we have to fake it here.
 		// See https://github.com/libfuse/libfuse/issues/62
 		b.mu.Lock()
-		for _, fh := range n.openFiles {
-			f = b.files[fh].file
-			b.files[fh].wg.Add(1)
-			defer b.files[fh].wg.Done()
-			break
+		var wg *sync.WaitGroup
+		n.openFiles.Range(func(fh uint64, _ struct{}) bool {
+			curr, _ := b.files.Load(fh)
+			f = curr.file
+			curr.wg.Add(1)
+			wg = &curr.wg
+			return false
+		})
+		if wg != nil {
+			defer wg.Done()
 		}
 		b.mu.Unlock()
 	}
@@ -813,22 +813,14 @@ func (b *rawBridge) releaseBackingIDRef(n *Inode) {
 // (eg. syscall.O_EXCL).
 func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntry {
 	fe := fileEntryPool.Get().(*fileEntry)
-	if len(b.freeFiles) > 0 {
-		last := len(b.freeFiles) - 1
-		fe.fh = b.freeFiles[last]
-		b.freeFiles = b.freeFiles[:last]
-		b.files[fe.fh] = fe
-	} else {
-		fe.fh = uint32(len(b.files))
-		b.files = append(b.files, fe)
-	}
+	fe.fh = uint32(n.currFhID.Add(1))
+	b.files.Store(uint64(fe.fh), fe)
 
 	if _, ok := f.(FileReaddirenter); ok {
 		fe.lastRead = make([]fuse.DirEntry, 0, 100)
 	}
-	fe.nodeIndex = len(n.openFiles)
 	fe.file = f
-	n.openFiles = append(n.openFiles, fe.fh)
+	n.openFiles.Store(uint64(fe.fh), struct{}{})
 
 	return fe
 }
@@ -908,7 +900,7 @@ func (b *rawBridge) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	defer b.mu.Unlock()
 
 	b.releaseBackingIDRef(n)
-	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
+	b.files.Delete(input.Fh)
 
 	fileEntryPool.Put(f)
 }
@@ -924,7 +916,7 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.releaseBackingIDRef(n)
-	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
+	b.files.Delete(input.Fh)
 
 	fileEntryPool.Put(f)
 }
@@ -936,14 +928,7 @@ func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*Inode, *fileEntry)
 	n, _ := b.kernelNodeIds.Load(nid)
 	var entry *fileEntry
 	if fh > 0 {
-		last := len(n.openFiles) - 1
-		entry = b.files[fh]
-		if last != entry.nodeIndex {
-			n.openFiles[entry.nodeIndex] = n.openFiles[last]
-
-			b.files[n.openFiles[entry.nodeIndex]].nodeIndex = entry.nodeIndex
-		}
-		n.openFiles = n.openFiles[:last]
+		n.openFiles.Delete(fh)
 	}
 	return n, entry
 }
@@ -1250,8 +1235,11 @@ func (b *rawBridge) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRange
 
 	n2 := b.getNode(in.NodeIdOut)
 
+	inFile, _ := b.files.Load(in.FhIn)
+	outFile, _ := b.files.Load(in.FhOut)
+
 	sz, errno := cfr.CopyFileRange(&fuse.Context{Caller: in.Caller, Cancel: cancel},
-		b.files[in.FhIn].file, in.OffIn, n2, b.files[in.FhOut].file, in.OffOut, in.Len, in.Flags)
+		inFile.file, in.OffIn, n2, outFile.file, in.OffOut, in.Len, in.Flags)
 	return sz, errnoToStatus(errno)
 }
 
@@ -1260,14 +1248,16 @@ func (b *rawBridge) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, out *fuse.Ls
 
 	ctx := &fuse.Context{Caller: in.Caller, Cancel: cancel}
 
+	inFile, _ := b.files.Load(in.Fh)
+
 	ls, ok := n.ops.(NodeLseeker)
 	if ok {
 		off, errno := ls.Lseek(ctx,
-			b.files[in.Fh].file, in.Offset, in.Whence)
+			inFile.file, in.Offset, in.Whence)
 		out.Offset = off
 		return errnoToStatus(errno)
 	}
-	if fs, ok := b.files[in.Fh].file.(FileLseeker); ok {
+	if fs, ok := inFile.file.(FileLseeker); ok {
 		off, errno := fs.Lseek(ctx, in.Offset, in.Whence)
 		out.Offset = off
 		return errnoToStatus(errno)

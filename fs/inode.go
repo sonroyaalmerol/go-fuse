@@ -12,10 +12,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 // StableAttr holds immutable attributes of a object in the filesystem.
@@ -67,7 +69,9 @@ type Inode struct {
 
 	// file handles.
 	// protected by bridge.mu
-	openFiles []uint32
+	openFiles *xsync.MapOf[uint64, struct{}]
+
+	currFhID atomic.Uint64
 
 	// backing files, protected by bridge.mu
 	backingIDRefcount int
@@ -129,6 +133,7 @@ func initInode(n *Inode, ops InodeEmbedder, attr StableAttr, bridge *rawBridge, 
 	if attr.Mode == fuse.S_IFDIR {
 		n.children.init()
 	}
+	n.openFiles = xsync.NewMapOf[uint64, struct{}]()
 }
 
 // Set node ID and mode in EntryOut

@@ -13,6 +13,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/internal"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 func errnoToStatus(errno syscall.Errno) fuse.Status {
@@ -84,7 +85,7 @@ type rawBridge struct {
 	// 1) file type ......... StableAttr.Mode
 	// 2) inode number ...... StableAttr.Ino
 	// 3) generation number . StableAttr.Gen
-	stableAttrs  shardedMap[StableAttr, *Inode]
+	stableAttrs  *xsync.MapOf[StableAttr, *Inode]
 	automaticIno uint64
 
 	// The *Node ID* is an arbitrary uint64 identifier chosen by the FUSE library.
@@ -95,7 +96,7 @@ type rawBridge struct {
 	// go-fuse Inode object.
 	//
 	// A simple incrementing counter is used as the NodeID (see `nextNodeID`).
-	kernelNodeIds shardedMap[uint64, *Inode]
+	kernelNodeIds *xsync.MapOf[uint64, *Inode]
 	// nextNodeID is the next free NodeID. Increment after copying the value.
 	nextNodeId uint64
 
@@ -280,8 +281,8 @@ func NewNodeFS(root InodeEmbedder, opts *Options) fuse.RawFileSystem {
 		automaticIno:  opts.FirstAutomaticIno,
 		server:        opts.ServerCallbacks,
 		nextNodeId:    2, // the root node has nodeid 1
-		stableAttrs:   shardedMap[StableAttr, *Inode]{},
-		kernelNodeIds: shardedMap[uint64, *Inode]{},
+		stableAttrs:   xsync.NewMapOf[StableAttr, *Inode](),
+		kernelNodeIds: xsync.NewMapOf[uint64, *Inode](),
 	}
 
 	if bridge.automaticIno == 0 {
@@ -295,9 +296,6 @@ func NewNodeFS(root InodeEmbedder, opts *Options) fuse.RawFileSystem {
 		bridge.options.EntryTimeout = &oneSec
 		bridge.options.AttrTimeout = &oneSec
 	}
-
-	bridge.stableAttrs.Init()
-	bridge.kernelNodeIds.Init()
 
 	stableAttr := StableAttr{
 		Ino:  root.embed().StableAttr().Ino,
@@ -335,11 +333,11 @@ func (b *rawBridge) String() string {
 }
 
 func (b *rawBridge) _getStableNode(id StableAttr) (*Inode, bool) {
-	return b.stableAttrs.Get(id)
+	return b.stableAttrs.Load(id)
 }
 
 func (b *rawBridge) _getNode(id uint64) *Inode {
-	node, ok := b.kernelNodeIds.Get(id)
+	node, ok := b.kernelNodeIds.Load(id)
 	if !ok {
 		return nil
 	}
@@ -353,11 +351,11 @@ func (b *rawBridge) getNode(id uint64) *Inode {
 }
 
 func (b *rawBridge) _setStableNode(id StableAttr, node *Inode) {
-	b.stableAttrs.Set(id, node)
+	b.stableAttrs.Store(id, node)
 }
 
 func (b *rawBridge) _setNode(id uint64, node *Inode) {
-	b.kernelNodeIds.Set(id, node)
+	b.kernelNodeIds.Store(id, node)
 }
 
 func (b *rawBridge) _removeStableNode(id StableAttr) {
@@ -519,27 +517,7 @@ func (b *rawBridge) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 
 func (b *rawBridge) Forget(nodeid, nlookup uint64) {
 	n := b.getNode(nodeid)
-	hasLookups, _, _ := n.removeRef(nlookup, false)
-
-	if !hasLookups {
-		b.compactMemory()
-	}
-}
-
-// compactMemory tries to free memory that was previously used by forgotten
-// nodes.
-//
-// Maps do not free all memory when elements get deleted
-// ( https://github.com/golang/go/issues/20135 ).
-// As a workaround, we recreate our two big maps (stableAttrs & kernelNodeIds)
-// every time they have shrunk dramatically (100 x smaller).
-// In this case, `nodeCountHigh` is reset to the new (smaller) size.
-func (b *rawBridge) compactMemory() {
-	// Compact stableAttrs and kernelNodeIds
-	b.mu.Lock()
-	b.stableAttrs.Compact()
-	b.kernelNodeIds.Compact()
-	b.mu.Unlock()
+	_, _, _ = n.removeRef(nlookup, false)
 }
 
 func (b *rawBridge) SetDebug(debug bool) {}
@@ -945,7 +923,7 @@ func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*Inode, *fileEntry)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	n, _ := b.kernelNodeIds.Get(nid)
+	n, _ := b.kernelNodeIds.Load(nid)
 	var entry *fileEntry
 	if fh > 0 {
 		last := len(n.openFiles) - 1

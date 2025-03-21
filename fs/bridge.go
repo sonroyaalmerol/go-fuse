@@ -26,6 +26,12 @@ var fileEntryPool = &sync.Pool{
 	},
 }
 
+var dirEntryPool = &sync.Pool{
+	New: func() interface{} {
+		return make([]fuse.DirEntry, 0, 100)
+	},
+}
+
 type fileEntry struct {
 	file FileHandle
 
@@ -824,7 +830,9 @@ func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntr
 	}
 
 	if _, ok := f.(FileReaddirenter); ok {
-		fe.lastRead = make([]fuse.DirEntry, 0, 100)
+		entries := dirEntryPool.Get().([]fuse.DirEntry)
+		entries = entries[:0] // Reset the slice length
+		fe.lastRead = entries
 	}
 	fe.nodeIndex = len(n.openFiles)
 	fe.file = f
@@ -910,6 +918,10 @@ func (b *rawBridge) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	b.releaseBackingIDRef(n)
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
 
+	if f.lastRead != nil {
+		dirEntryPool.Put(f.lastRead)
+		f.lastRead = nil
+	}
 	fileEntryPool.Put(f)
 }
 
@@ -926,6 +938,10 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	b.releaseBackingIDRef(n)
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
 
+	if f.lastRead != nil {
+		dirEntryPool.Put(f.lastRead)
+		f.lastRead = nil
+	}
 	fileEntryPool.Put(f)
 }
 

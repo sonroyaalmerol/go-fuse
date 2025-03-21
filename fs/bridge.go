@@ -531,17 +531,14 @@ func (b *rawBridge) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *
 		// descriptor, so we have to fake it here.
 		// See https://github.com/libfuse/libfuse/issues/62
 		b.mu.Lock()
-		var wg *sync.WaitGroup
+		var curr *fileEntry
 		n.openFiles.Range(func(fh uint64, _ struct{}) bool {
-			curr, _ := b.files.Load(fh)
+			curr, _ = b.files.Load(fh)
 			f = curr.file
 			curr.wg.Add(1)
-			wg = &curr.wg
 			return false
 		})
-		if wg != nil {
-			defer wg.Done()
-		}
+		defer curr.wg.Done()
 		b.mu.Unlock()
 	}
 	ctx := &fuse.Context{Caller: input.Caller, Cancel: cancel}
@@ -928,6 +925,7 @@ func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*Inode, *fileEntry)
 	n, _ := b.kernelNodeIds.Load(nid)
 	var entry *fileEntry
 	if fh > 0 {
+		entry, _ = b.files.Load(fh)
 		n.openFiles.Delete(fh)
 	}
 	return n, entry

@@ -821,6 +821,7 @@ func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntr
 		b.files = append(b.files, fe)
 	}
 
+	fe.dirStream = nil
 	fe.nodeIndex = len(n.openFiles)
 	fe.file = f
 	n.openFiles = append(n.openFiles, fe.fh)

@@ -90,6 +90,11 @@ func selectDirEntryPool(totalLength int) (pool *sync.Pool, poolSize int) {
 	return last.Pool, last.Size
 }
 
+func putDirEntryToPool(entries []fuse.DirEntry) {
+	pool, _ := selectDirEntryPool(cap(entries))
+	pool.Put(entries)
+}
+
 type fileEntry struct {
 	file FileHandle
 
@@ -994,8 +999,7 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
 
 	if f.lastRead != nil {
-		dirEntryPool, _ := selectDirEntryPool(len(f.lastRead))
-		dirEntryPool.Put(f.lastRead)
+		putDirEntryToPool(f.lastRead)
 		f.lastRead = nil
 	}
 	fileEntryPool.Put(f)

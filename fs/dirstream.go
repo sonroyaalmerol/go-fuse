@@ -37,7 +37,8 @@ func (a *dirArray) Seekdir(ctx context.Context, off uint64) syscall.Errno {
 }
 
 func (a *dirArray) Close() {
-
+	pool, _ := selectDirEntryPool(len(a.entries))
+	pool.Put(a.entries)
 }
 
 func (a *dirArray) Releasedir(ctx context.Context, releaseFlags uint32) {}

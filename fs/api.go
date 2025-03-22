@@ -459,6 +459,9 @@ type DirStream interface {
 	// indicate I/O errors
 	Next() (fuse.DirEntry, syscall.Errno)
 
+	// Seek resets the stream to a specific offset
+	Seekdir(ctx context.Context, offset uint64) syscall.Errno
+
 	// Close releases resources related to this directory
 	// stream.
 	Close()

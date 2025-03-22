@@ -26,73 +26,10 @@ var fileEntryPool = &sync.Pool{
 	},
 }
 
-// BufferPool groups a fixed-size buffer and an associated sync.Pool.
-type BufferPool struct {
-	Size int
-	Pool *sync.Pool
-}
-
-// Define a handful of pools with different buffer sizes.
-var dirEntryPools = []BufferPool{
-	{
-		Size: 8,
-		Pool: &sync.Pool{
-			New: func() interface{} {
-				return make([]fuse.DirEntry, 0, 8)
-			},
-		},
+var lastReadPool = &sync.Pool{
+	New: func() any {
+		return make([]fuse.DirEntry, 0, 8)
 	},
-	{
-		Size: 16,
-		Pool: &sync.Pool{
-			New: func() interface{} {
-				return make([]fuse.DirEntry, 0, 16)
-			},
-		},
-	},
-	{
-		Size: 32,
-		Pool: &sync.Pool{
-			New: func() interface{} {
-				return make([]fuse.DirEntry, 0, 32)
-			},
-		},
-	},
-	{
-		Size: 64,
-		Pool: &sync.Pool{
-			New: func() interface{} {
-				return make([]fuse.DirEntry, 0, 64)
-			},
-		},
-	},
-	{
-		Size: 128,
-		Pool: &sync.Pool{
-			New: func() interface{} {
-				return make([]fuse.DirEntry, 0, 128)
-			},
-		},
-	},
-}
-
-// selectBufferPool returns a pool and its size based on the requested total
-// length. The heuristic is: pick the smallest pool whose capacity is at least
-// the requested length; if none qualifies, use the largest pool.
-func selectDirEntryPool(totalLength int) (pool *sync.Pool, poolSize int) {
-	for _, bp := range dirEntryPools {
-		if totalLength <= bp.Size {
-			return bp.Pool, bp.Size
-		}
-	}
-	// Default to the largest pool.
-	last := dirEntryPools[len(dirEntryPools)-1]
-	return last.Pool, last.Size
-}
-
-func putDirEntryToPool(entries []fuse.DirEntry) {
-	pool, _ := selectDirEntryPool(cap(entries))
-	pool.Put(entries)
 }
 
 type fileEntry struct {
@@ -893,8 +830,7 @@ func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntr
 	}
 
 	if _, ok := f.(FileReaddirenter); ok {
-		selectedPool, _ := selectDirEntryPool(0)
-		entries := selectedPool.Get().([]fuse.DirEntry)
+		entries := lastReadPool.Get().([]fuse.DirEntry)
 		entries = entries[:0] // Reset the slice length
 		fe.lastRead = entries
 	}
@@ -999,7 +935,7 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
 
 	if f.lastRead != nil {
-		putDirEntryToPool(f.lastRead)
+		lastReadPool.Put(f.lastRead)
 		f.lastRead = nil
 	}
 	fileEntryPool.Put(f)
@@ -1132,9 +1068,7 @@ func (b *rawBridge) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fus
 
 func (n *Inode) childrenAsDirstream() DirStream {
 	lst := n.childrenList()
-	dirPool, _ := selectDirEntryPool(len(lst))
-	r := dirPool.Get().([]fuse.DirEntry)
-	r = r[:0]
+	r := make([]fuse.DirEntry, len(lst))
 	for _, e := range lst {
 		r = append(r, fuse.DirEntry{Mode: e.Inode.Mode(),
 			Name: e.Name,

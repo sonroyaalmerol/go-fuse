@@ -20,9 +20,9 @@ func errnoToStatus(errno syscall.Errno) fuse.Status {
 	return fuse.Status(errno)
 }
 
-var fileEntryPool = &sync.Pool{
-	New: func() any {
-		return &fileEntry{}
+var dirEntryPool = &sync.Pool{
+	New: func() interface{} {
+		return make([]fuse.DirEntry, 0, 100)
 	},
 }
 
@@ -812,7 +812,7 @@ func (b *rawBridge) releaseBackingIDRef(n *Inode) {
 // registerFile hands out a file handle. Must have bridge.mu. Flags are the open flags
 // (eg. syscall.O_EXCL).
 func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntry {
-	fe := fileEntryPool.Get().(*fileEntry)
+	fe := &fileEntry{}
 	if len(b.freeFiles) > 0 {
 		last := len(b.freeFiles) - 1
 		fe.fh = b.freeFiles[last]
@@ -824,10 +824,9 @@ func (b *rawBridge) registerFile(n *Inode, f FileHandle, flags uint32) *fileEntr
 	}
 
 	if _, ok := f.(FileReaddirenter); ok {
-		if fe.lastRead == nil {
-			fe.lastRead = make([]fuse.DirEntry, 0, 100)
-		}
-		fe.lastRead = fe.lastRead[:0]
+		entries := dirEntryPool.Get().([]fuse.DirEntry)
+		entries = entries[:0] // Reset the slice length
+		fe.lastRead = entries
 	}
 	fe.nodeIndex = len(n.openFiles)
 	fe.file = f
@@ -912,8 +911,6 @@ func (b *rawBridge) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 
 	b.releaseBackingIDRef(n)
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
-
-	fileEntryPool.Put(f)
 }
 
 func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
@@ -930,9 +927,9 @@ func (b *rawBridge) ReleaseDir(input *fuse.ReleaseIn) {
 	b.freeFiles = append(b.freeFiles, uint32(input.Fh))
 
 	if f.lastRead != nil {
-		f.lastRead = f.lastRead[:0]
+		dirEntryPool.Put(f.lastRead)
+		f.lastRead = nil
 	}
-	fileEntryPool.Put(f)
 }
 
 func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*Inode, *fileEntry) {

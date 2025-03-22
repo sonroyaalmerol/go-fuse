@@ -28,7 +28,7 @@ var fileEntryPool = &sync.Pool{
 
 var dirEntryPool = &sync.Pool{
 	New: func() interface{} {
-		return make([]fuse.DirEntry, 0, 100)
+		return make([]fuse.DirEntry, 0, 4096)
 	},
 }
 

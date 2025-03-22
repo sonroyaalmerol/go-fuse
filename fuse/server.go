@@ -61,7 +61,7 @@ type Server struct {
 	reqPool sync.Pool
 
 	// Pool for raw requests data
-	readPool bytePool
+	readPool sync.Pool
 
 	reqMu      sync.Mutex
 	reqReaders int
@@ -216,7 +216,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool = newBytePool(maxReaders*2, func() interface{} {
+	ms.readPool.New = func() interface{} {
 		targetSize := o.MaxWrite + int(maxInputSize)
 		if targetSize < _FUSE_MIN_READ_BUFFER {
 			targetSize = _FUSE_MIN_READ_BUFFER
@@ -228,7 +228,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		buf := make([]byte, targetSize+logicalBlockSize)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
-	})
+	}
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -338,7 +338,7 @@ func handleEINTR(fn func() error) (err error) {
 
 // Returns a new request, or error. In case exitIdle is given, returns
 // nil, OK if we have too many readers already.
-func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
+func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	ms.reqMu.Lock()
 	if ms.reqReaders > ms.maxReaders {
 		ms.reqMu.Unlock()
@@ -348,8 +348,9 @@ func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
 	ms.reqMu.Unlock()
 
 	reqIface := ms.reqPool.Get()
-	req := reqIface.(*requestAlloc)
-	dest := ms.readPool.Get()
+	req = reqIface.(*requestAlloc)
+	destIface := ms.readPool.Get()
+	dest := destIface.([]byte)
 
 	var n int
 	err := handleEINTR(func() error {
@@ -358,12 +359,12 @@ func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
 		return err
 	})
 	if err != nil {
-		ms.reqPool.Put(req)
-		ms.readPool.Put(dest)
+		code = ToStatus(err)
+		ms.reqPool.Put(reqIface)
 		ms.reqMu.Lock()
 		ms.reqReaders--
 		ms.reqMu.Unlock()
-		return nil, ToStatus(err)
+		return nil, code
 	}
 
 	if ms.latencies != nil {
@@ -374,9 +375,6 @@ func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
 	gobbled := req.setInput(dest[:n])
 	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
 		log.Printf("Short read for input header: %v", req.inputBuf)
-		ms.reqPool.Put(req)
-		ms.readPool.Put(dest)
-		ms.reqReaders--
 		return nil, EINVAL
 	}
 	opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
@@ -387,7 +385,7 @@ func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
 	needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
 
 	if !gobbled {
-		ms.readPool.Put(dest)
+		ms.readPool.Put(destIface)
 	}
 	ms.reqReaders--
 	if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure {
@@ -402,22 +400,20 @@ func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
 func (ms *Server) returnRequest(req *requestAlloc) {
 	ms.recordStats(&req.request)
 
-	if buf := req.bufferPoolOutputBuf; buf != nil {
+	if req.bufferPoolOutputBuf != nil {
+		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
 		req.bufferPoolOutputBuf = nil
-		ms.buffers.FreeBuffer(buf)
 	}
-
-	if buf := req.bufferPoolInputBuf; buf != nil {
-		req.bufferPoolInputBuf = nil
-		ms.readPool.Put(buf)
-	}
-
 	if req.interrupted {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
-
 	req.clear()
+
+	if p := req.bufferPoolInputBuf; p != nil {
+		req.bufferPoolInputBuf = nil
+		ms.readPool.Put(p)
+	}
 	ms.reqPool.Put(req)
 }
 
